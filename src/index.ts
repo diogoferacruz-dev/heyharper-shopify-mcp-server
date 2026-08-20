@@ -16,8 +16,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express, { Request, Response, NextFunction } from "express";
 import { z } from "zod";
-import { loadStores, StoreConfig, CHARACTER_LIMIT } from "./config.js";
+import { loadStores, StoreConfig, CHARACTER_LIMIT, loadEverstox } from "./config.js";
 import { pullStoreOrders, ShopifyError, NormalizedOrder } from "./shopify.js";
+import { getTracking } from "./everstox.js";
+import { classifyStore, applyTracking, buildMarkdown, FlaggedOrder } from "./report.js";
 
 const STORES: StoreConfig[] = loadStores();
 
@@ -241,6 +243,112 @@ A store that fails to authorize or times out is reported with ok=false and an er
     }
     const results = await Promise.all(STORES.map((s) => pullOne(s, params.since_days)));
     return packageResponse(results, params.since_days, params.response_format);
+  },
+);
+
+const GetTrackingSchema = z
+  .object({
+    order_numbers: z
+      .array(z.string())
+      .min(1)
+      .max(500)
+      .describe("Order numbers (e.g. '284513_3', '533862_2') to look up in Everstox."),
+  })
+  .strict();
+
+server.registerTool(
+  "heyharper_get_tracking",
+  {
+    title: "Look up Everstox tracking for a list of orders",
+    description: `Cross-check a list of order numbers against Everstox and return tracking for any that have already SHIPPED there. A shipment only exists once an order actually ships, so its presence means the order shipped even if Shopify still shows it unfulfilled (the tracking-not-synced case).
+
+Args:
+  - order_numbers (string[]): order numbers to check.
+
+Returns (json): { everstoxConfigured, tracking: { "<order_number>": { shipped, codes[], carrier, shipmentDate, url, error? } } }
+
+Requires EVERSTOX_BASE_URL, EVERSTOX_SHOP_API_TOKEN, EVERSTOX_SHOP_ID env vars; if unset, everstoxConfigured=false and no lookups run.`,
+    inputSchema: GetTrackingSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async (params) => {
+    const ev = loadEverstox();
+    if (!ev) {
+      const out = { everstoxConfigured: false, tracking: {} };
+      return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }], structuredContent: out };
+    }
+    const tracking = await getTracking(ev, params.order_numbers);
+    const out = { everstoxConfigured: true, tracking };
+    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }], structuredContent: out };
+  },
+);
+
+const DailyReportSchema = z
+  .object({
+    since_days: z.number().int().min(1).max(365).default(45).describe("Days back to pull by created_at (default 45)."),
+    test: z.boolean().default(false).describe("Mark the report as a test run (adds a test label to the markdown)."),
+  })
+  .strict();
+
+server.registerTool(
+  "heyharper_daily_report",
+  {
+    title: "Build the finalized daily 'Orders Requiring Attention' report",
+    description: `The one-call daily report. Pulls PAID, NOT-cancelled, FULLY-unfulfilled orders across ALL stores, applies the finalized needs-attention rules, re-routes US-store orders shipping outside US/CA into the EU tab (they fulfil from Germany), and folds in Everstox tracking so already-shipped orders (tracking not synced to Shopify) are separated from genuinely-unshipped ones.
+
+Rules: clock = released_hold_at if present else processed_at; late = business days since clock >= LATE_BUSINESS_DAYS (default 2, weekends excluded, warehouse TZ); oos = any line under stock on OOS-applicable stores; excluded = OOS_EVERSTOX, or HOLD_EVERSTOX/set_on_hold without released_hold.
+
+Args:
+  - since_days (number, default 45)
+  - test (boolean, default false)
+
+Returns: content[0].text is Slack-ready markdown (post it as-is to #daily-unfulfilled). structuredContent has { generatedAt, everstoxUsed, totals, storeErrors, flagged[] } for programmatic use.`,
+    inputSchema: DailyReportSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async (params) => {
+    if (STORES.length === 0) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: no stores configured. Set HH_<KEY>_DOMAIN and HH_<KEY>_TOKEN env vars." }],
+      };
+    }
+    const nowIso = new Date().toISOString();
+    const results = await Promise.all(STORES.map((s) => pullOne(s, params.since_days)));
+
+    const storeErrors: { store: string; error: string }[] = [];
+    let flagged: FlaggedOrder[] = [];
+    for (const r of results) {
+      if (!r.ok) {
+        storeErrors.push({ store: r.store, error: r.error || "unknown error" });
+        continue;
+      }
+      flagged = flagged.concat(classifyStore(r.orders, r.store, nowIso));
+    }
+
+    const ev = loadEverstox();
+    let everstoxUsed = false;
+    if (ev && flagged.length) {
+      const tracking = await getTracking(ev, flagged.map((f) => f.name));
+      applyTracking(flagged, tracking);
+      everstoxUsed = true;
+    }
+
+    const markdown = buildMarkdown(flagged, nowIso, { test: params.test });
+    const structured = {
+      generatedAt: nowIso,
+      everstoxUsed,
+      totals: {
+        needsAction: flagged.length,
+        shipped: flagged.filter((f) => f.shipped).length,
+        unshipped: flagged.filter((f) => !f.shipped).length,
+      },
+      storeErrors,
+      flagged,
+    };
+    let text = markdown;
+    if (text.length > CHARACTER_LIMIT) text = text.slice(0, CHARACTER_LIMIT) + "\n\n... [truncated]";
+    return { content: [{ type: "text", text }], structuredContent: structured };
   },
 );
 

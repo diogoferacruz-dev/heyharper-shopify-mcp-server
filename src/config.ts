@@ -65,3 +65,44 @@ export function loadStores(): StoreConfig[] {
 
 export const API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
 export const CHARACTER_LIMIT = 100000; // orders payloads can be large; generous cap
+
+// Business-day lateness threshold (JD prefers 2). Override with LATE_BUSINESS_DAYS.
+export const LATE_BUSINESS_DAYS = parseInt(process.env.LATE_BUSINESS_DAYS || "2", 10);
+
+// Static per-store lookups (derived from SEEDS) for classification/report building.
+export const STORE_TZ: Record<string, string> = Object.fromEntries(
+  SEEDS.map((s) => [s.key, s.timezone]),
+);
+export const STORE_LABEL_SHORT: Record<string, string> = {
+  us: "US",
+  eu: "EU",
+  uk: "UK",
+  br: "BR",
+  mx: "MX",
+};
+
+// ---- Everstox (fulfilment backend) ----
+// Used to recover tracking codes for orders shipped in Everstox but not yet
+// synced back to Shopify. Two auth modes (matching the Python client):
+//   A) shop API token  -> header "everstox-shop-api-token"
+//   B) JWT dashboard login (email + password) -> Bearer token, auto-refresh
+// Needs baseUrl + shopId + (shopApiToken OR (email AND password)); otherwise
+// the cross-check is skipped gracefully.
+export interface EverstoxConfig {
+  baseUrl: string;
+  shopId: string;
+  shopApiToken?: string;
+  email?: string;
+  password?: string;
+}
+export function loadEverstox(): EverstoxConfig | null {
+  const baseUrl = (process.env.EVERSTOX_BASE_URL || "").replace(/\/$/, "");
+  const shopId = process.env.EVERSTOX_SHOP_ID || "";
+  const shopApiToken = process.env.EVERSTOX_SHOP_API_TOKEN || "";
+  const email = process.env.EVERSTOX_EMAIL || "";
+  const password = process.env.EVERSTOX_PASSWORD || "";
+  if (!baseUrl || !shopId) return null;
+  if (shopApiToken) return { baseUrl, shopId, shopApiToken };
+  if (email && password) return { baseUrl, shopId, email, password };
+  return null;
+}
