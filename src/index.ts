@@ -471,8 +471,10 @@ async function main() {
   }
 
   const mcpPath = process.env.MCP_PATH || "/mcp";
-  app.post(mcpPath, authMiddleware, async (req, res) => {
-    // Stateless: a fresh transport per request avoids request-id collisions.
+
+  // The actual MCP request handler. Stateless: a fresh transport per request
+  // avoids request-id collisions.
+  const handleMcp = async (req: Request, res: Response) => {
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,
@@ -480,7 +482,22 @@ async function main() {
     res.on("close", () => transport.close());
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
-  });
+  };
+
+  // Route A — header auth (Authorization: Bearer <token>). Used by the Claude
+  // Code CLI and direct API callers. Returns 401 on bad/missing token.
+  app.post(mcpPath, authMiddleware, handleMcp);
+
+  // Route B — path-token auth: /mcp/<token>. For the claude.ai custom-connector
+  // UI, which only speaks OAuth and has no static-token field. Putting the
+  // secret in the URL means claude.ai connects straight through and never
+  // triggers its OAuth "sign-in registration" flow. A wrong/absent token 404s
+  // (NOT 401) so claude.ai never sees an auth challenge to react to.
+  app.post(`${mcpPath}/:key`, (req: Request, res: Response, next: NextFunction) => {
+    const required = process.env.MCP_AUTH_TOKEN;
+    if (!required || req.params.key === required) return next();
+    res.status(404).json({ error: "not found" });
+  }, handleMcp);
 
   const port = parseInt(process.env.PORT || "3000", 10);
   app.listen(port, () => {
