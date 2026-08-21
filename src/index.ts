@@ -20,6 +20,7 @@ import { loadStores, StoreConfig, CHARACTER_LIMIT, loadEverstox } from "./config
 import { pullStoreOrders, ShopifyError, NormalizedOrder } from "./shopify.js";
 import { getTracking } from "./everstox.js";
 import { classifyStore, applyTracking, buildMarkdown, FlaggedOrder } from "./report.js";
+import { buildMatrixifyWorkbook, matrixifyFilename } from "./matrixify.js";
 
 const STORES: StoreConfig[] = loadStores();
 
@@ -112,6 +113,41 @@ function packageResponse(results: StorePullResult[], sinceDays: number, format: 
     content: [{ type: "text" as const, text }],
     structuredContent: structured,
   };
+}
+
+interface PipelineResult {
+  generatedAt: string;
+  flagged: FlaggedOrder[];
+  storeErrors: { store: string; error: string }[];
+  everstoxUsed: boolean;
+}
+
+// Shared "needs attention" pipeline: pull all stores -> classify -> fold in
+// Everstox tracking. Used by both the daily report and the Matrixify export so
+// the two can never diverge.
+async function runNeedsAttentionPipeline(sinceDays: number): Promise<PipelineResult> {
+  const generatedAt = new Date().toISOString();
+  const results = await Promise.all(STORES.map((s) => pullOne(s, sinceDays)));
+
+  const storeErrors: { store: string; error: string }[] = [];
+  let flagged: FlaggedOrder[] = [];
+  for (const r of results) {
+    if (!r.ok) {
+      storeErrors.push({ store: r.store, error: r.error || "unknown error" });
+      continue;
+    }
+    flagged = flagged.concat(classifyStore(r.orders, r.store, generatedAt));
+  }
+
+  const ev = loadEverstox();
+  let everstoxUsed = false;
+  if (ev && flagged.length) {
+    const tracking = await getTracking(ev, flagged.map((f) => f.name));
+    applyTracking(flagged, tracking);
+    everstoxUsed = true;
+  }
+
+  return { generatedAt, flagged, storeErrors, everstoxUsed };
 }
 
 // ---- server + tools -------------------------------------------------------
@@ -313,26 +349,8 @@ Returns: content[0].text is Slack-ready markdown (post it as-is to #daily-unfulf
         content: [{ type: "text", text: "Error: no stores configured. Set HH_<KEY>_DOMAIN and HH_<KEY>_TOKEN env vars." }],
       };
     }
-    const nowIso = new Date().toISOString();
-    const results = await Promise.all(STORES.map((s) => pullOne(s, params.since_days)));
-
-    const storeErrors: { store: string; error: string }[] = [];
-    let flagged: FlaggedOrder[] = [];
-    for (const r of results) {
-      if (!r.ok) {
-        storeErrors.push({ store: r.store, error: r.error || "unknown error" });
-        continue;
-      }
-      flagged = flagged.concat(classifyStore(r.orders, r.store, nowIso));
-    }
-
-    const ev = loadEverstox();
-    let everstoxUsed = false;
-    if (ev && flagged.length) {
-      const tracking = await getTracking(ev, flagged.map((f) => f.name));
-      applyTracking(flagged, tracking);
-      everstoxUsed = true;
-    }
+    const { generatedAt: nowIso, flagged, storeErrors, everstoxUsed } =
+      await runNeedsAttentionPipeline(params.since_days);
 
     const markdown = buildMarkdown(flagged, nowIso, { test: params.test });
     const structured = {
@@ -349,6 +367,65 @@ Returns: content[0].text is Slack-ready markdown (post it as-is to #daily-unfulf
     let text = markdown;
     if (text.length > CHARACTER_LIMIT) text = text.slice(0, CHARACTER_LIMIT) + "\n\n... [truncated]";
     return { content: [{ type: "text", text }], structuredContent: structured };
+  },
+);
+
+const MatrixifyExportSchema = z
+  .object({
+    since_days: z.number().int().min(1).max(365).default(45).describe("Days back to pull by created_at (default 45)."),
+    notify_customer: z
+      .boolean()
+      .default(false)
+      .describe("Value for the 'Fulfillment: Send Notification' column. false (default) = no shipping email is sent on import; true = Shopify emails the customer the tracking on import."),
+  })
+  .strict();
+
+server.registerTool(
+  "heyharper_matrixify_export",
+  {
+    title: "Export a Matrixify tracking-import workbook (base64 .xlsx)",
+    description: `Runs the same needs-attention pipeline as heyharper_daily_report, then builds a Matrixify "Orders" tracking-import workbook containing ONLY the orders already shipped in Everstox (tracking code present) — the ones whose tracking needs pushing into Shopify. One sheet per store, named "Orders US" / "Orders EU" / "Orders UK", so Matrixify recognizes each as an Orders import.
+
+Columns: Name, Fulfillment: Status (=success), Fulfillment: Tracking Number, Fulfillment: Tracking Company, Fulfillment: Tracking URL, Fulfillment: Send Notification.
+
+Grouping is by the order's ORIGINATING store, not the display tab — US orders re-routed to the EU tab still export under "Orders US" because tracking is imported into the store the order lives in. US / EU / UK are separate Shopify stores: import each sheet into its own store (select just that sheet in the Matrixify preview).
+
+Args:
+  - since_days (number, default 45)
+  - notify_customer (boolean, default false)
+
+Returns: content[0].text is a short human summary. structuredContent = { generatedAt, filename, mimeType, base64, counts: { us, eu, uk }, total, notifyCustomer, storeErrors }. base64 is the .xlsx file — attach it directly (e.g. email it via a Gmail 'attachments' field).`,
+    inputSchema: MatrixifyExportSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  async (params) => {
+    if (STORES.length === 0) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: "Error: no stores configured. Set HH_<KEY>_DOMAIN and HH_<KEY>_TOKEN env vars." }],
+      };
+    }
+    const { generatedAt, flagged, storeErrors } = await runNeedsAttentionPipeline(params.since_days);
+    const { buffer, counts, total } = buildMatrixifyWorkbook(flagged, { notify: params.notify_customer });
+    const filename = matrixifyFilename(generatedAt);
+
+    const structured = {
+      generatedAt,
+      filename,
+      mimeType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      base64: buffer.toString("base64"),
+      counts: { us: counts.us ?? 0, eu: counts.eu ?? 0, uk: counts.uk ?? 0 },
+      total,
+      notifyCustomer: params.notify_customer,
+      storeErrors,
+    };
+    const summary =
+      `Matrixify tracking workbook ${filename}: ${total} shipped order(s) ` +
+      `(US ${structured.counts.us} · EU ${structured.counts.eu} · UK ${structured.counts.uk}), ` +
+      `Send Notification=${params.notify_customer ? "TRUE" : "FALSE"}. ` +
+      `base64 .xlsx is in structuredContent.base64.` +
+      (storeErrors.length ? ` Store errors: ${storeErrors.map((e) => e.store).join(", ")}.` : "");
+    return { content: [{ type: "text", text: summary }], structuredContent: structured };
   },
 );
 
